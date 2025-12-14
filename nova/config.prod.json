@@ -1,0 +1,489 @@
+(function (global) {
+  "use strict";
+
+  // ====== Guard: prevent duplicate bundle execution ======
+  if (global.__NOVA_CHAT_BUNDLE_LOADED__) return;
+  global.__NOVA_CHAT_BUNDLE_LOADED__ = true;
+
+  // ====== Boot config injected by Squarespace loader ======
+  var BOOT = global.NOVA_CHAT || {};
+  var API_URL = BOOT.apiUrl || "https://novanura-chatbot.onrender.com/chat";
+  var AMAZON_URL = BOOT.amazonUrl || "https://www.amazon.com/dp/B0FQ1KHJQS";
+  var CONFIG_URL = BOOT.configUrl || "";
+  var DEBUG = !!BOOT.debug;
+
+  function dbg() {
+    if (DEBUG) console.log.apply(console, arguments);
+  }
+
+  // ====== Defaults (merged with remote config) ======
+  var DEFAULT_CONFIG = {
+    enabled: true,
+    headerTitle: "Nova",
+    headerCtaLabel: "Shop on Amazon →",
+    launcherEmoji: "💬",
+    inputPlaceholder: "Ask Nova…",
+    greet: {
+      line1: "Hi — I’m Nova 👋",
+      line2: "Want the fastest help? Tap one:",
+      quickReplies: [
+        { label: "Is it right for me?", message: "Help me decide if NovaNura is right for me." },
+        { label: "How do I use it?", message: "How do I use NovaNura? Give me a simple routine." },
+        { label: "Ingredients & safety", message: "What are the ingredients and safety notes?" },
+        { label: "Buy now", action: "open_amazon" }
+      ],
+      softPitch: "You can shop here anytime:\n{{AMAZON_URL}}"
+    },
+    sales: {
+      closeNudge: "Want the simplest next step — how to use it, ingredients, or where to buy?"
+    },
+    safety: {
+      medicalRedirect:
+        "I can share general product info, but I can’t diagnose or give medical advice. If you have a scalp condition, are pregnant/nursing, or take medications, it’s best to check with a clinician.",
+      emergencyRedirect:
+        "If you’re having severe symptoms (like trouble breathing, swelling, or intense burning), stop using the product and seek urgent medical care.",
+      irritationNote:
+        "If irritation occurs: stop use, rinse with water, and consider a patch test before trying again."
+    }
+  };
+
+  // ====== Persistence ======
+  var ENABLE_PERSISTENCE = true;
+  var MAX_STORED_MSGS = 30;
+  var LS_KEY = "nova_chat_state_v1";
+
+  function deepMerge(target, source) {
+    if (!source || typeof source !== "object") return target;
+    for (var k in source) {
+      if (!Object.prototype.hasOwnProperty.call(source, k)) continue;
+      var sv = source[k];
+      var tv = target[k];
+      if (sv && typeof sv === "object" && !Array.isArray(sv)) {
+        target[k] = deepMerge(tv && typeof tv === "object" ? tv : {}, sv);
+      } else {
+        target[k] = sv;
+      }
+    }
+    return target;
+  }
+
+  function renderTemplate(str, vars) {
+    if (!str) return str;
+    return String(str).replace(/\{\{(\w+)\}\}/g, function (_, key) {
+      return vars && vars[key] != null ? String(vars[key]) : "";
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // Token-based linkify: prevents linkifying inside our CTA href
+  function linkifyHtml(text, amazonUrl) {
+    var safe = escapeHtml(text);
+    var TOKEN = "__NOVA_AMAZON_CTA__";
+
+    var amazonEscaped = amazonUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    var amazonRegex = new RegExp(amazonEscaped, "g");
+
+    var out = safe.replace(amazonRegex, TOKEN);
+
+    out = out.replace(/(https:\/\/[^\s<]+)/g, function (m) {
+      return '<a href="' + m + '" target="_blank" rel="noopener">' + m + "</a>";
+    });
+
+    var ctaHtml =
+      '<a class="nova-cta" href="' +
+      amazonUrl +
+      '" target="_blank" rel="noopener">Shop on Amazon →</a>';
+
+    out = out.replace(new RegExp(TOKEN, "g"), ctaHtml);
+    return out;
+  }
+
+  function classifySafety(text) {
+    var t = (text || "").toLowerCase();
+    var emergency = /(trouble breathing|can't breathe|swelling|throat|hives|anaphyl|severe burn|severe burning)/i.test(t);
+    var medical = /(diagnos|psoriasis|eczema|dermatitis|infection|bleeding|pus|open wound|pregnan|nursing|breastfeed|medication|isotretinoin|accutane|steroid)/i.test(t);
+    var irritation = /(burn|sting|itch|rash|redness|irritat|allerg)/i.test(t);
+    return { emergency: emergency, medical: medical, irritation: irritation };
+  }
+
+  function localSafetyReply(text, cfg) {
+    var f = classifySafety(text);
+    if (f.emergency) return cfg.safety.emergencyRedirect;
+    if (f.medical) return cfg.safety.medicalRedirect;
+    if (f.irritation) return cfg.safety.irritationNote + "\n\n" + cfg.safety.medicalRedirect;
+    return null;
+  }
+
+  function safeOpen(url) {
+    try {
+      global.open(url, "_blank", "noopener");
+    } catch (_) {
+      global.location.href = url;
+    }
+  }
+
+  function persistMessages(messagesEl) {
+    if (!ENABLE_PERSISTENCE) return;
+    try {
+      var items = [];
+      for (var i = 0; i < messagesEl.children.length; i++) {
+        var node = messagesEl.children[i];
+        if (node.classList && node.classList.contains("nova-quick")) continue;
+        var who = node.classList && node.classList.contains("nova-user") ? "user" : "bot";
+        var text = (node.textContent || "").trim();
+        if (text) items.push({ who: who, text: text });
+      }
+      items = items.slice(-MAX_STORED_MSGS);
+      localStorage.setItem(LS_KEY, JSON.stringify({ items: items }));
+    } catch (_) {}
+  }
+
+  function restoreMessages(messagesEl, amazonUrl) {
+    if (!ENABLE_PERSISTENCE) return false;
+    try {
+      var raw = localStorage.getItem(LS_KEY);
+      if (!raw) return false;
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.items) || !parsed.items.length) return false;
+
+      parsed.items.forEach(function (it) {
+        var div = document.createElement("div");
+        div.className = "nova-msg " + (it.who === "user" ? "nova-user" : "nova-bot");
+        div.innerHTML = linkifyHtml(it.text, amazonUrl);
+        messagesEl.appendChild(div);
+      });
+
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ====== Styles (only inject once) ======
+  function ensureStyles() {
+    var id = "nova-chat-style";
+    if (document.getElementById(id)) return;
+
+    var style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+#nova-chat-launcher{
+  position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;
+  border:none;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.22);
+  font-size:22px;z-index:2147483647;background:#fff;
+}
+#nova-chat-panel{
+  position:fixed;right:18px;bottom:86px;width:390px;height:540px;
+  max-width:calc(100vw - 36px);max-height:calc(100vh - 130px);
+  background:#fff;border-radius:14px;box-shadow:0 12px 38px rgba(0,0,0,.25);
+  display:none;overflow:hidden;z-index:2147483647;
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+}
+#nova-chat-header{
+  padding:10px 12px;border-bottom:1px solid rgba(0,0,0,.08);
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+}
+#nova-header-right{display:flex;gap:8px;align-items:center;}
+#nova-header-cta{
+  display:inline-block;padding:8px 10px;border-radius:10px;background:#111;
+  color:#fff !important;text-decoration:none !important;font-weight:800;font-size:12px;
+  border:1px solid rgba(0,0,0,.15);white-space:nowrap;
+}
+#nova-close{
+  border:1px solid rgba(0,0,0,.18);background:#fff;border-radius:10px;
+  padding:8px 10px;cursor:pointer;font-size:14px;line-height:14px;
+}
+#nova-chat-body{display:flex;flex-direction:column;height:calc(100% - 48px);}
+#nova-chat-messages{flex:1;padding:12px;overflow:auto;background:#fafafa;}
+.nova-msg{
+  max-width:92%;padding:10px 12px;margin:8px 0;border-radius:12px;
+  font-size:14px;white-space:pre-wrap;word-break:break-word;
+}
+.nova-user{margin-left:auto;background:#111;color:#fff;}
+.nova-bot{margin-right:auto;background:#fff;border:1px solid rgba(0,0,0,.1);color:#111;}
+.nova-msg a{color:#111;text-decoration:underline;font-weight:700;}
+.nova-cta{
+  display:inline-block;margin-top:8px;padding:10px 12px;border-radius:10px;
+  border:1px solid rgba(0,0,0,.15);background:#fff;text-decoration:none !important;font-weight:900;
+}
+.nova-quick{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px;}
+.nova-quick button{
+  border:1px solid rgba(0,0,0,.15);background:#fff;border-radius:999px;
+  padding:8px 10px;cursor:pointer;font-size:12px;font-weight:700;
+}
+#nova-chat-inputbar{display:flex;gap:8px;padding:10px;border-top:1px solid rgba(0,0,0,.08);background:#fff;}
+#nova-chat-input{flex:1;padding:10px;border:1px solid rgba(0,0,0,.2);border-radius:10px;font-size:14px;outline:none;}
+#nova-chat-send{padding:10px 14px;border:none;border-radius:10px;background:#111;color:#fff;cursor:pointer;font-size:14px;font-weight:800;}
+#nova-chat-send:disabled{opacity:.6;cursor:not-allowed;}
+@media(max-width:420px){#nova-chat-panel{width:calc(100vw - 36px);height:72vh;}#nova-header-cta{display:none;}}
+`;
+    document.head.appendChild(style);
+  }
+
+  // ====== Fetch config (optional) ======
+  function fetchJsonWithTimeout(url, ms) {
+    var ctrl = new AbortController();
+    var t = setTimeout(function () {
+      try { ctrl.abort(); } catch (_) {}
+    }, ms);
+
+    return fetch(url, { signal: ctrl.signal, cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("Bad status " + res.status);
+        return res.json();
+      })
+      .finally(function () {
+        clearTimeout(t);
+      });
+  }
+
+  // ====== Mount / Re-mount ======
+  var mounting = false;
+  async function mountIfMissing() {
+    if (mounting) return;
+    if (!document.body) return;
+    if (document.getElementById("nova-chat-launcher")) return;
+
+    mounting = true;
+    try {
+      ensureStyles();
+
+      // Remove stale remnants (safe)
+      var staleLauncher = document.getElementById("nova-chat-launcher");
+      var stalePanel = document.getElementById("nova-chat-panel");
+      if (staleLauncher) staleLauncher.remove();
+      if (stalePanel) stalePanel.remove();
+
+      var cfg = deepMerge({}, DEFAULT_CONFIG);
+
+      if (CONFIG_URL) {
+        try {
+          var remote = await fetchJsonWithTimeout(CONFIG_URL, 1800);
+          cfg = deepMerge(cfg, remote);
+        } catch (e) {
+          dbg("[NovaChat] config fetch failed:", e);
+        }
+      }
+
+      // Apply templates
+      cfg.greet.softPitch = renderTemplate(cfg.greet.softPitch, { AMAZON_URL: AMAZON_URL });
+
+      // Kill switch
+      if (!cfg.enabled) {
+        dbg("[NovaChat] disabled by config");
+        return;
+      }
+
+      // Elements
+      var launcher = document.createElement("button");
+      launcher.id = "nova-chat-launcher";
+      launcher.textContent = cfg.launcherEmoji || "💬";
+      launcher.setAttribute("aria-label", "Open Nova chat");
+
+      var panel = document.createElement("div");
+      panel.id = "nova-chat-panel";
+
+      var header = document.createElement("div");
+      header.id = "nova-chat-header";
+      header.innerHTML =
+        "<strong>" +
+        escapeHtml(cfg.headerTitle || "Nova") +
+        "</strong>" +
+        '<div id="nova-header-right">' +
+        '<a id="nova-header-cta" href="' +
+        AMAZON_URL +
+        '" target="_blank" rel="noopener">' +
+        escapeHtml(cfg.headerCtaLabel || "Shop on Amazon →") +
+        "</a>" +
+        '<button id="nova-close" aria-label="Close chat">✕</button>' +
+        "</div>";
+
+      var body = document.createElement("div");
+      body.id = "nova-chat-body";
+
+      var messages = document.createElement("div");
+      messages.id = "nova-chat-messages";
+
+      var inputbar = document.createElement("div");
+      inputbar.id = "nova-chat-inputbar";
+
+      var input = document.createElement("input");
+      input.id = "nova-chat-input";
+      input.placeholder = cfg.inputPlaceholder || "Ask Nova…";
+      input.autocomplete = "off";
+
+      var send = document.createElement("button");
+      send.id = "nova-chat-send";
+      send.textContent = "Send";
+
+      function addMsg(text, who) {
+        var div = document.createElement("div");
+        div.className = "nova-msg " + (who === "user" ? "nova-user" : "nova-bot");
+        div.innerHTML = linkifyHtml(text, AMAZON_URL);
+        messages.appendChild(div);
+        messages.scrollTop = messages.scrollHeight;
+        persistMessages(messages);
+        return div;
+      }
+
+      function addQuickReplies(items) {
+        var wrap = document.createElement("div");
+        wrap.className = "nova-quick";
+
+        (items || []).forEach(function (it) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.textContent = it.label;
+
+          b.addEventListener("click", function () {
+            if (it.action === "open_amazon") {
+              safeOpen(AMAZON_URL);
+              return;
+            }
+            input.value = it.message || it.label;
+            sendMessage();
+          });
+
+          wrap.appendChild(b);
+        });
+
+        messages.appendChild(wrap);
+        messages.scrollTop = messages.scrollHeight;
+      }
+
+      function greetIfEmpty() {
+        if (messages.children.length) return;
+        addMsg(cfg.greet.line1, "bot");
+        addMsg(cfg.greet.line2, "bot");
+        addQuickReplies(cfg.greet.quickReplies);
+        addMsg(cfg.greet.softPitch, "bot");
+      }
+
+      async function sendMessage() {
+        var text = (input.value || "").trim();
+        if (!text) return;
+
+        input.value = "";
+        send.disabled = true;
+
+        addMsg(text, "user");
+
+        // Fast local safety intercept
+        var local = localSafetyReply(text, cfg);
+        if (local) {
+          addMsg(local, "bot");
+          addMsg(cfg.sales.closeNudge + "\n" + AMAZON_URL, "bot");
+          send.disabled = false;
+          input.focus();
+          return;
+        }
+
+        var thinking = addMsg("Thinking…", "bot");
+
+        try {
+          var res = await fetch(API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text })
+          });
+
+          var data = {};
+          try { data = await res.json(); } catch (_) {}
+
+          thinking.remove();
+          addMsg(data.reply || "Sorry — I didn’t catch that. Can you rephrase?", "bot");
+          addMsg(cfg.sales.closeNudge + "\n" + AMAZON_URL, "bot");
+        } catch (e) {
+          thinking.remove();
+          addMsg("Sorry — something glitched. Please try again.\n\n" + AMAZON_URL, "bot");
+        } finally {
+          send.disabled = false;
+          input.focus();
+        }
+      }
+
+      // Events
+      launcher.addEventListener("click", function () {
+        panel.style.display = panel.style.display === "block" ? "none" : "block";
+        if (panel.style.display === "block") {
+          var restored = restoreMessages(messages, AMAZON_URL);
+          if (!restored) greetIfEmpty();
+          input.focus();
+        }
+      });
+
+      header.addEventListener("click", function (e) {
+        if (e.target && e.target.id === "nova-close") panel.style.display = "none";
+      });
+
+      send.addEventListener("click", sendMessage);
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") sendMessage();
+      });
+
+      // Assemble
+      inputbar.appendChild(input);
+      inputbar.appendChild(send);
+      body.appendChild(messages);
+      body.appendChild(inputbar);
+      panel.appendChild(header);
+      panel.appendChild(body);
+
+      document.body.appendChild(launcher);
+      document.body.appendChild(panel);
+
+      dbg("[NovaChat] mounted");
+    } finally {
+      mounting = false;
+    }
+  }
+
+  // ====== Boot + watchdog (Squarespace SPA-friendly) ======
+  function bootWatchdog() {
+    mountIfMissing();
+
+    // retry for a bit (covers delayed DOM and Squarespace nav swaps)
+    var n = 0;
+    var iv = setInterval(function () {
+      n++;
+      mountIfMissing();
+      if (n > 40) clearInterval(iv); // ~20s
+    }, 500);
+
+    // popstate is safe
+    global.addEventListener("popstate", function () {
+      mountIfMissing();
+    });
+
+    // patch history once (guarded)
+    if (!global.__NOVA_HISTORY_PATCHED__) {
+      global.__NOVA_HISTORY_PATCHED__ = true;
+
+      var _push = history.pushState;
+      history.pushState = function () {
+        var r = _push.apply(this, arguments);
+        try { mountIfMissing(); } catch (_) {}
+        return r;
+      };
+
+      var _replace = history.replaceState;
+      history.replaceState = function () {
+        var r2 = _replace.apply(this, arguments);
+        try { mountIfMissing(); } catch (_) {}
+        return r2;
+      };
+    }
+  }
+
+  function waitForBody(tries) {
+    if (document.body) return bootWatchdog();
+    if (tries <= 0) return;
+    setTimeout(function () { waitForBody(tries - 1); }, 50);
+  }
+
+  waitForBody(200);
+})(window);
